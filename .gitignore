@@ -1,0 +1,4 @@
+build/*
+.cache/*
+extern/*
+compile_commands.json
