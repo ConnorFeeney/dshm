@@ -12,6 +12,7 @@ list(FILTER DSHM_SOURCE EXCLUDE REGEX "/extern/pybind11/docs/")
 
 add_library(dshm ${DSHM_SOURCE})
 target_include_directories(dshm PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(dshm PUBLIC atomic)
 
-add_executable(dshm_test examples/shm_test.cc)
-target_link_libraries(dshm_test PRIVATE dshm)
+add_executable(testp ${CMAKE_SOURCE_DIR}/examples/test.cc)
+target_link_libraries(testp PRIVATE dshm)
