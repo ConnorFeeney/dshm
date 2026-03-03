@@ -42,6 +42,17 @@ public:
         return heap->read_at<T>(this->address);
     }
 
+    template<typename U,
+         typename = std::enable_if_t<
+             std::is_integral_v<T> &&
+             std::is_integral_v<U> &&
+             (sizeof(U) > sizeof(T)) &&
+             std::is_unsigned_v<U> == std::is_unsigned_v<T> &&
+             !std::is_same_v<U, T>>>
+    operator U() const {
+        return static_cast<U>(static_cast<T>(*this));
+    }
+
     shared_object& operator=(const T& value) {
         if (!heap) {
             return *this;
