@@ -5,6 +5,8 @@ int main() {
     testObj = 2;
 
     std::cout << testObj << std::endl;
+    std::cout << testObj.addr() << std::endl;
+    
     std::cin.get();
     return 0;
 }
