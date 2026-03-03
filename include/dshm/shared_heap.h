@@ -237,6 +237,9 @@ public:
                     } else {
                         // Shared heap mutex protects non-lock-free construction.
                         pthread_mutex_lock(&head->heapMutex);
+                        if (errno == EOWNERDEAD) {
+                            pthread_mutex_consistent(&head->heapMutex);
+                        }
                         ::new (objPtr) T(std::forward<Args>(args)...);
                         pthread_mutex_unlock(&head->heapMutex);
                     }
@@ -282,6 +285,9 @@ public:
         if (needLock) {
             heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
             pthread_mutex_lock(&head->heapMutex);
+            if (errno == EOWNERDEAD) {
+                pthread_mutex_consistent(&head->heapMutex);
+            }
             *reinterpret_cast<T*>(objPtr) = value;
             pthread_mutex_unlock(&head->heapMutex);
         } else {
@@ -307,6 +313,9 @@ public:
         if (needLock) {
             heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
             pthread_mutex_lock(&head->heapMutex);
+            if (errno == EOWNERDEAD) {
+                pthread_mutex_consistent(&head->heapMutex);
+            }
             value = *reinterpret_cast<T*>(objPtr);
             pthread_mutex_unlock(&head->heapMutex);
         } else {
