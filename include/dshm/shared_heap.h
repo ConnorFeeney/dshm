@@ -193,7 +193,6 @@ public:
             reinterpret_cast<heapHeader*>(this->memoryp)->noResize.store(1, std::memory_order_acquire);
             shm_unlink(this->name.c_str());
         }
-
  
         munmap(this->memoryp, localBrk);
         close(this->heapfd);
@@ -219,7 +218,7 @@ public:
             while (nextFreeOffset != -1) {
                 free = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + nextFreeOffset);
                 char* blockStart = reinterpret_cast<char*>(free);
-                const std::size_t requestSize = allocation_size(blockStart, sizeof(T));
+                const std::size_t requestSize = lockFreeObject ? allocation_size(blockStart, sizeof(std::atomic<T>)) : allocation_size(blockStart, sizeof(std::atomic<T>));
 
                 if (free->size.load(std::memory_order_acquire) >= requestSize) {
                     free = reinterpret_cast<freeBlockHeader*>(fragment(free, requestSize));
@@ -251,64 +250,7 @@ public:
             std::size_t currentBrk = head->brk.load(std::memory_order_acquire);
             char* base = reinterpret_cast<char*>(this->memoryp);
             char* blockStart = base + currentBrk;
-            const std::size_t requestSize = allocation_size(blockStart, sizeof(T));
-            const std::size_t required = currentBrk + requestSize;
-            const std::size_t doubled = currentBrk * 2u;
-            std::size_t target = required > doubled ? required : doubled;
-            if (target == 0 || brk(target) == 0) {
-                return 0;
-            }
-
-            if (verrifyMapping() < 0) {
-                return 0;
-            }
-        }
-
-        return 0;
-    }
-
-    template<typename T>
-    std::size_t allocate_array(std::size_t num) {
-        if constexpr (!std::is_trivially_copyable_v<T>) {
-            return 0;
-        }
-
-        if (verrifyMapping() < 0) {
-            return 0;
-        }
-
-        const bool lockFreeObject = std::atomic<T>().is_lock_free();
-
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
-            std::int64_t nextFreeOffset = head->nextFree.load(std::memory_order_acquire);
-            freeBlockHeader* free = nullptr;
-
-            while (nextFreeOffset != -1) {
-                free = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + nextFreeOffset);
-                char* blockStart = reinterpret_cast<char*>(free);
-                const std::size_t requestSize = allocation_size(blockStart, sizeof(T) * num);
-
-                if (free->size.load(std::memory_order_acquire) >= requestSize) {
-                    free = reinterpret_cast<freeBlockHeader*>(fragment(free, requestSize));
-
-                    std::size_t allocSize = free->size.load(std::memory_order_acquire);
-                    blockHeader* header = reinterpret_cast<blockHeader*>(blockStart);
-                    header->sizeAndFlags.store(pack_block_header(allocSize, !lockFreeObject), std::memory_order_release);
-
-                    char* objPtr = blockStart + sizeof(blockHeader);
-                    objPtr += align8_offset(objPtr);
-
-                    return static_cast<std::size_t>(objPtr - reinterpret_cast<char*>(this->memoryp));
-                }
-
-                nextFreeOffset = free->next.load(std::memory_order_acquire);
-            }
-
-            std::size_t currentBrk = head->brk.load(std::memory_order_acquire);
-            char* base = reinterpret_cast<char*>(this->memoryp);
-            char* blockStart = base + currentBrk;
-            const std::size_t requestSize = allocation_size(blockStart, sizeof(T) * num);
+            const std::size_t requestSize = lockFreeObject ? allocation_size(blockStart, sizeof(std::atomic<T>)) : allocation_size(blockStart, sizeof(T));
             const std::size_t required = currentBrk + requestSize;
             const std::size_t doubled = currentBrk * 2u;
             std::size_t target = required > doubled ? required : doubled;
