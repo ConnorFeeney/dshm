@@ -1,712 +1,437 @@
 #pragma once
 
-// ISO Includes
-#include <atomic>
-#include <csignal>
-#include <cstdint>
-#include <iostream>
-#include <string>
-#include <system_error>
-#include <type_traits>
-#include <utility>
+#include "dshm/shm.h"
+#include <unordered_map>
 
-// GNU Includes
-#include <sys/mman.h>
-#include <sys/stat.h> 
-#include <fcntl.h> 
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <pthread.h>
 
-typedef struct heapHeader {
-    std::atomic<std::uint8_t> noResize;
-    std::atomic<pid_t> ownerPID;
-    std::atomic<std::uint64_t> brk;
-    std::atomic<std::int64_t> nextFree;
-    std::atomic<std::uint64_t> version;
+typedef struct heap_header {
     pthread_mutex_t heapMutex;
-} heapHeader;
+    std::atomic<std::int64_t> block;
+} heap_header;
 
-struct freeBlockHeader {
+typedef struct block_header {
+    std::atomic<std::size_t> meta;
     std::atomic<std::int64_t> next;
     std::atomic<std::int64_t> prev;
-    std::atomic<std::size_t> size;
-};
+} blockHeader;
 
-struct blockHeader {
-    std::atomic<std::uint64_t> sizeAndFlags;
-};
+static constexpr std::size_t K_BLOCK_ALLOCATED = 1UL << 0;
+static constexpr std::size_t K_BLOCK_ATOMIC = 1UL << 1;
+static constexpr std::size_t K_BLOCK_ATOMIC_REF = 1UL << 2;
+static constexpr std::size_t K_BLOCK_FLAG_MASK = K_BLOCK_ALLOCATED | K_BLOCK_ATOMIC | K_BLOCK_ATOMIC_REF;
 
-inline std::size_t align8_offset(const void* p) {
+static std::size_t align8_offset(const void* p) {
     std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
     std::size_t rem = v & 0x7;
     return rem ? (8 - rem) : 0;
 }
 
-inline char* align8_down(char* p) {
-    std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
-    v &= ~static_cast<std::uintptr_t>(0x7);
-    return reinterpret_cast<char*>(v);
+static std::size_t pack_block_meta(std::size_t size, std::size_t flags) {
+    size = round8_down(size);
+    return (size & ~K_BLOCK_FLAG_MASK) | (flags & K_BLOCK_FLAG_MASK);
+}
+
+static std::size_t unpack_block_size(std::size_t meta) {
+    std::size_t dat = meta & ~K_BLOCK_FLAG_MASK;
+    return dat;
+}
+
+static std::size_t unpack_block_flags(std::size_t meta) {
+    return meta & K_BLOCK_FLAG_MASK;
 }
 
 class shared_heap {
 public:
-    shared_heap(std::string name, std::error_code& ec) {
-        this->isOwner = false;
-        if (!atomics_lock_free()) {
-            std::cerr << "atomics not lock-free";
+    shared_heap(std::string name) {
+        memory = create_shm(name, &this->sstat);
+        if (!memory) {
             return;
         }
-        // Attemp to create a new SHM
-        bool newSHM = false;
-        this->heapfd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRWXU | S_IRWXG | S_IRWXO);
-        if (this->heapfd != -1) {
-            newSHM = true;
-        } else if(this->heapfd < 0 && errno == EEXIST) {
-            this->heapfd = shm_open(name.c_str(), O_CREAT | O_RDWR, S_IRWXU | S_IRWXG | S_IRWXO);
-            if (this->heapfd == -1) {
-                std::cerr << "shm old";
-                return;
-            }
-        } else {
-            std::cerr << "shm";
-            return;
-        }
+        this->name = name;
 
-        heapHeader* head = nullptr;
-
-        std::size_t pageSize = sysconf(_SC_PAGESIZE);
-        std::size_t bufferSize = 0;
-        if (!newSHM) {
-            struct stat st;
-            if(fstat(this->heapfd, &st) < 0) {
-                std::cerr << "fstat";
-                return;
-            }
-
-            bufferSize = st.st_size;
-        }
-
-        bool isValidSize = true;
-        if (!newSHM) {
-            isValidSize = bufferSize >= 2 * pageSize;
-            if (!isValidSize) {
-                newSHM = true;
-            }
-        }
-
-        if (!newSHM) {
-            head = reinterpret_cast<heapHeader*>(mmap(NULL, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, this->heapfd, 0));
-            if (head == MAP_FAILED) {
-                std::cerr << "ptr";
-                return;
-            }
-
-            std::size_t ownerPID = head->ownerPID.load(std::memory_order_acquire);
-
-            bool ownerRunning = false;
-            if (kill(ownerPID, 0) == 0) {
-                ownerRunning = true;
-                this->isOwner = false;
-            } else if (errno == EPERM) {
-                ownerRunning = true;
-                this->isOwner = false;
-            }
-
-            if (!ownerRunning) {
-                head->ownerPID.store(getpid(), std::memory_order_release);
-                head->noResize.store(0, std::memory_order_release);
-                this->isOwner = true;
-            }
-
-            if(munmap(head, bufferSize) < 0) {
-                std::cerr << "munmap no own";
-                return;
-            }
-        }
-
-        if (newSHM) {
-            this->isOwner = true;
-            if (ftruncate(this->heapfd, 2 * pageSize) < 0) {
-                std::cerr << "ftruncate";
-                return;
-            }
-            bufferSize = 2 * pageSize;
-
-            head = reinterpret_cast<heapHeader*>(mmap(NULL, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, this->heapfd, 0));
-            if (head == MAP_FAILED) {
-                std::cerr << "ptr";
-                return;
-            }
-
-            head->ownerPID.store(getpid(), std::memory_order_release);
-            head->brk.store(bufferSize, std::memory_order_release);
-
-            std::size_t nextf = + sizeof(heapHeader) + align8_offset(reinterpret_cast<char*>(head) + sizeof(heapHeader));
-            head->nextFree.store(nextf, std::memory_order_release);
-
-            freeBlockHeader* firstFree = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(head) + nextf);
-            firstFree->next.store(-1, std::memory_order_release);
-            firstFree->prev.store(-1, std::memory_order_release);
-            firstFree->size.store(bufferSize - nextf, std::memory_order_release);
-
-            head->version.store(0, std::memory_order_release);
-            head->noResize.store(0, std::memory_order_release);
-
+        heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        if (shm_stat_creator(&this->sstat)) {
             pthread_mutexattr_t attr;
             if (pthread_mutexattr_init(&attr) != 0) {
-                std::cerr << "mutexattr init";
                 return;
             }
             if (pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0) {
-                std::cerr << "mutexattr pshared";
                 pthread_mutexattr_destroy(&attr);
                 return;
             }
             if (pthread_mutex_init(&head->heapMutex, &attr) != 0) {
-                std::cerr << "mutex init";
                 pthread_mutexattr_destroy(&attr);
                 return;
             }
             pthread_mutexattr_destroy(&attr);
-
-            if(munmap(head, bufferSize) < 0) {
-                std::cerr << "munmap";
-                return;
-            }
         }
 
-        this->name = name;
-        this->memoryp = mmap(NULL, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, this->heapfd, 0);
-        if (this->memoryp == MAP_FAILED) {
-            std::cerr << "memoryp";
-            return;
-        }
-        this->localVersion = reinterpret_cast<heapHeader*>(this->memoryp)->version.load(std::memory_order_acquire);
-        this->localBrk = reinterpret_cast<heapHeader*>(this->memoryp)->brk.load(std::memory_order_acquire);
+        std::size_t nextf = sizeof(heap_header) + align8_offset(reinterpret_cast<char*>(head) + sizeof(heap_header));
+        block_header* free = reinterpret_cast<block_header*>(reinterpret_cast<char*>(this->memory) + nextf);
+        free->next.store(-1, std::memory_order_release);
+        free->prev.store(-1, std::memory_order_release);
+        std::size_t blockSize = round8_down(sstat.size - nextf);
+        free->meta.store(pack_block_meta(blockSize, 0), std::memory_order_release);
+
+        head->block.store(nextf, std::memory_order_release);
     }
 
     ~shared_heap() {
-        if (isOwner) {
-            reinterpret_cast<heapHeader*>(this->memoryp)->noResize.store(1, std::memory_order_acquire);
-            shm_unlink(this->name.c_str());
+        if (shm_stat_owner(&this->sstat)) {
+            unlink_shm(&this->memory, this->name, &this->sstat);
         }
- 
-        munmap(this->memoryp, localBrk);
-        close(this->heapfd);
+
+        unmap_shm(&this->memory, &this->sstat);
     }
 
     template<typename T, typename... Args>
     std::size_t allocate(Args... args) {
-        if constexpr (!std::is_trivially_copyable_v<T>) {
+        if (!verify_shm(&this->memory, &sstat)) {
             return 0;
         }
-
-        if (verrifyMapping() < 0) {
+        const bool lockFree = std::atomic<T>::is_always_lock_free;
+        const std::size_t objSize = lockFree ? sizeof(std::atomic<T>) : sizeof(T);
+        block_header* block = nullptr;
+        std::size_t blockAddr = get_block(&block, objSize);
+        if (block == nullptr) {
             return 0;
         }
+        char* blockStart = reinterpret_cast<char*>(this->memory) + blockAddr;
+        char* objPtr = blockStart + sizeof(block_header);
+        objPtr += align8_offset(objPtr);
 
-        const bool lockFreeObject = std::atomic<T>().is_lock_free();
-
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
-            std::int64_t nextFreeOffset = head->nextFree.load(std::memory_order_acquire);
-            freeBlockHeader* free = nullptr;
-
-            while (nextFreeOffset != -1) {
-                free = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + nextFreeOffset);
-                char* blockStart = reinterpret_cast<char*>(free);
-                const std::size_t requestSize = lockFreeObject ? allocation_size(blockStart, sizeof(std::atomic<T>)) : allocation_size(blockStart, sizeof(std::atomic<T>));
-
-                if (free->size.load(std::memory_order_acquire) >= requestSize) {
-                    free = reinterpret_cast<freeBlockHeader*>(fragment(free, requestSize));
-
-                    std::size_t allocSize = free->size.load(std::memory_order_acquire);
-                    blockHeader* header = reinterpret_cast<blockHeader*>(blockStart);
-                    header->sizeAndFlags.store(pack_block_header(allocSize, !lockFreeObject), std::memory_order_release);
-
-                    char* objPtr = blockStart + sizeof(blockHeader);
-                    objPtr += align8_offset(objPtr);
-
-                    if (lockFreeObject) {
-                        // Store lock-free objects as atomics for direct load/store.
-                        T initial(std::forward<Args>(args)...);
-                        ::new (objPtr) std::atomic<T>(initial);
-                    } else {
-                        // Shared heap mutex protects non-lock-free construction.
-                        pthread_mutex_lock(&head->heapMutex);
-                        if (errno == EOWNERDEAD) {
-                            pthread_mutex_consistent(&head->heapMutex);
-                        }
-                        ::new (objPtr) T(std::forward<Args>(args)...);
-                        pthread_mutex_unlock(&head->heapMutex);
-                    }
-
-                    return static_cast<std::size_t>(objPtr - reinterpret_cast<char*>(this->memoryp));
-                }
-
-                nextFreeOffset = free->next.load(std::memory_order_acquire);
-            }
-
-            std::size_t currentBrk = head->brk.load(std::memory_order_acquire);
-            char* base = reinterpret_cast<char*>(this->memoryp);
-            char* blockStart = base + currentBrk;
-            const std::size_t requestSize = lockFreeObject ? allocation_size(blockStart, sizeof(std::atomic<T>)) : allocation_size(blockStart, sizeof(T));
-            const std::size_t required = currentBrk + requestSize;
-            const std::size_t doubled = currentBrk * 2u;
-            std::size_t target = required > doubled ? required : doubled;
-            if (target == 0 || brk(target) == 0) {
-                return 0;
-            }
-
-            if (verrifyMapping() < 0) {
-                return 0;
-            }
+        std::size_t flags = K_BLOCK_ALLOCATED;
+        if (lockFree) {
+            flags |= K_BLOCK_ATOMIC;
         }
 
-        return 0;
-    }
+        std::size_t blockSize = unpack_block_size(block->meta.load(std::memory_order_acquire));
+        block->meta.store(pack_block_meta(blockSize, flags), std::memory_order_release);
 
-    template<typename T>
-    void write_at(std::size_t offset, const T& value) {
-        if (verrifyMapping() < 0) {
-            return;
-        }
-
-        char* base = reinterpret_cast<char*>(this->memoryp);
-        char* objPtr = base + offset;
-
-        char* blockStart = align8_down(objPtr - sizeof(blockHeader));
-        auto* header = reinterpret_cast<blockHeader*>(blockStart);
-        const bool needLock = unpack_need_lock(header->sizeAndFlags.load(std::memory_order_acquire));
-
-        if (needLock) {
-            heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
+        if (lockFree) {
+            T initial(std::forward<Args>(args)...);
+            ::new (objPtr) std::atomic<T>(initial);
+        } else {
+            heap_header* head = reinterpret_cast<heap_header*>(this->memory);
             pthread_mutex_lock(&head->heapMutex);
             if (errno == EOWNERDEAD) {
                 pthread_mutex_consistent(&head->heapMutex);
             }
-            *reinterpret_cast<T*>(objPtr) = value;
+            ::new (objPtr) T(std::forward<Args>(args)...);
             pthread_mutex_unlock(&head->heapMutex);
+        }
+
+        return static_cast<std::size_t>(objPtr - reinterpret_cast<char*>(this->memory));
+    }
+
+    template<typename T>
+    std::size_t allocate_array(std::size_t size) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return 0;
+        }
+        const bool lockFree = std::atomic<T>::is_always_lock_free;
+        const std::size_t arraySizeBytes = sizeof(T) * size;
+        block_header* block = nullptr;
+        std::size_t blockAddr = get_block(&block, arraySizeBytes);
+        if (block == nullptr) {
+            return 0;
+        }
+
+        char* blockStart = reinterpret_cast<char*>(this->memory) + blockAddr;
+        char* objPtr = blockStart + sizeof(block_header);
+        objPtr += align8_offset(objPtr);
+
+        std::size_t flags = K_BLOCK_ALLOCATED;
+        if (lockFree) {
+            flags |= K_BLOCK_ATOMIC_REF;
+        }
+
+        std::size_t blockSize = unpack_block_size(block->meta.load(std::memory_order_acquire));
+        block->meta.store(pack_block_meta(blockSize, flags), std::memory_order_release);
+
+        return static_cast<std::size_t>(objPtr - reinterpret_cast<char*>(this->memory));
+    }
+
+    bool free(std::size_t addr) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return false;
+        }
+
+        char* base = reinterpret_cast<char*>(this->memory);
+        if (addr == 0) {
+            return false;
+        }
+
+        char* objPtr = base + addr;
+        char* blockStart = reinterpret_cast<char*>(round8_down(reinterpret_cast<std::uintptr_t>(objPtr - sizeof(block_header))));
+
+        std::size_t blockAddr = static_cast<std::size_t>(blockStart - base);
+        block_header* block = reinterpret_cast<block_header*>(blockStart);
+        std::size_t blockMeta = block->meta.load(std::memory_order_acquire);
+        std::size_t blockFlags = unpack_block_flags(blockMeta);
+        if ((blockFlags & K_BLOCK_ALLOCATED) == 0) {
+            return false;
+        }
+
+        std::size_t blockSize = unpack_block_size(blockMeta);
+
+        std::int64_t nextOffset = block->next.load(std::memory_order_acquire);
+        if (nextOffset != -1) {
+            block_header* nextBlock = reinterpret_cast<block_header*>(base + nextOffset);
+            std::size_t nextMeta = nextBlock->meta.load(std::memory_order_acquire);
+            if ((unpack_block_flags(nextMeta) & K_BLOCK_ALLOCATED) == 0) {
+                std::size_t nextSize = unpack_block_size(nextMeta);
+                std::int64_t nextNext = nextBlock->next.load(std::memory_order_acquire);
+
+                blockSize += nextSize;
+                block->next.store(nextNext, std::memory_order_release);
+                if (nextNext != -1) {
+                    block_header* nextNextBlock = reinterpret_cast<block_header*>(base + nextNext);
+                    nextNextBlock->prev.store(blockAddr, std::memory_order_release);
+                }
+            }
+        }
+
+        std::int64_t prevOffset = block->prev.load(std::memory_order_acquire);
+        if (prevOffset != -1) {
+            block_header* prevBlock = reinterpret_cast<block_header*>(base + prevOffset);
+            std::size_t prevMeta = prevBlock->meta.load(std::memory_order_acquire);
+            if ((unpack_block_flags(prevMeta) & K_BLOCK_ALLOCATED) == 0) {
+                std::size_t prevSize = unpack_block_size(prevMeta);
+                std::int64_t nextAfter = block->next.load(std::memory_order_acquire);
+
+                blockSize += prevSize;
+                prevBlock->next.store(nextAfter, std::memory_order_release);
+                if (nextAfter != -1) {
+                    block_header* nextBlock = reinterpret_cast<block_header*>(base + nextAfter);
+                    nextBlock->prev.store(prevOffset, std::memory_order_release);
+                }
+
+                block = prevBlock;
+            }
+        }
+
+        block->meta.store(pack_block_meta(blockSize, 0), std::memory_order_release);
+        return true;
+    }
+
+    template<typename T>
+    T read(std::size_t addr) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return T{};
+        }
+
+        char* base = reinterpret_cast<char*>(this->memory);
+        char* objPtr = base + addr;
+        char* blockStart = reinterpret_cast<char*>(round8_down(reinterpret_cast<std::uintptr_t>(objPtr - sizeof(block_header))));
+
+        block_header* block = reinterpret_cast<block_header*>(blockStart);
+        
+
+        return this->read<T>(objPtr, block);
+    }
+
+    template<typename T>
+    T read_index(std::size_t addr, std::size_t index) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return T{};
+        }
+
+        char* base = reinterpret_cast<char*>(this->memory);
+        char* baseObjPtr = base + addr;
+        char* blockStart = reinterpret_cast<char*>(round8_down(reinterpret_cast<std::uintptr_t>(baseObjPtr - sizeof(block_header))));
+
+        char* objPtr = baseObjPtr + (index * sizeof(T));
+        block_header* block = reinterpret_cast<block_header*>(blockStart);
+        
+
+        return this->read<T>(objPtr, block);
+    }
+
+    template<typename T>
+    bool write(std::size_t addr, const T& val) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return false;
+        }
+
+        char* base = reinterpret_cast<char*>(this->memory);
+        char* objPtr = base + addr;
+        char* blockStart = reinterpret_cast<char*>(round8_down(reinterpret_cast<std::uintptr_t>(objPtr - sizeof(block_header))));
+
+        block_header* block = reinterpret_cast<block_header*>(blockStart);
+        
+        this->write<T>(objPtr, block, val);
+
+        return true;
+    }
+
+    template<typename T>
+    bool write_index(std::size_t addr, std::size_t index, const T& val) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return false;
+        }
+
+        char* base = reinterpret_cast<char*>(this->memory);
+        char* baseObjPtr = base + addr;
+        char* blockStart = reinterpret_cast<char*>(round8_down(reinterpret_cast<std::uintptr_t>(baseObjPtr - sizeof(block_header))));
+
+        char* objPtr = baseObjPtr + (index * sizeof(T));
+        block_header* block = reinterpret_cast<block_header*>(blockStart);
+
+        this->write<T>(objPtr, block, val);
+        return true;
+    }
+
+private:
+    template<typename T>
+    void write(char* objPtr, block_header* block,  const T& val) {
+        const std::uint64_t blockMeta = block->meta.load(std::memory_order_acquire);
+        const std::uint64_t blockFlags = unpack_block_flags(blockMeta);
+
+        const bool isAtomic = blockFlags & K_BLOCK_ATOMIC;
+        const bool isAtomicRef = blockFlags & K_BLOCK_ATOMIC_REF;
+
+        if (isAtomic) {
+            auto* obj = reinterpret_cast<std::atomic<T>*>(objPtr);
+            obj->store(val, std::memory_order_release);
+        } else if (isAtomicRef) {
+            std::atomic_ref<T> ref(*reinterpret_cast<T*>(objPtr));
+            ref.store(val, std::memory_order_release);
         } else {
-            auto* atomicPtr = reinterpret_cast<std::atomic<T>*>(objPtr);
-            atomicPtr->store(value, std::memory_order_release);
+            heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+            pthread_mutex_lock(&head->heapMutex);
+            if (errno == EOWNERDEAD) {
+                pthread_mutex_consistent(&head->heapMutex);
+            }
+            *reinterpret_cast<T*>(objPtr) = val;
+            pthread_mutex_unlock(&head->heapMutex);
         }
     }
 
     template<typename T>
-    T read_at(std::size_t offset) {
-        if (verrifyMapping() < 0) {
-            return T{};
-        }
+    T read(char* objPtr, block_header* block) {
+        const std::uint64_t blockMeta = block->meta.load(std::memory_order_acquire);
+        const std::uint64_t blockFlags = unpack_block_flags(blockMeta);
 
-        char* base = reinterpret_cast<char*>(this->memoryp);
-        char* objPtr = base + offset;
-
-        char* blockStart = align8_down(objPtr - sizeof(blockHeader));
-        auto* header = reinterpret_cast<blockHeader*>(blockStart);
-        const bool needLock = unpack_need_lock(header->sizeAndFlags.load(std::memory_order_acquire));
+        const bool isAtomic = blockFlags & K_BLOCK_ATOMIC;
+        const bool isAtomicRef = blockFlags & K_BLOCK_ATOMIC_REF;
 
         T value{};
-        if (needLock) {
-            heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
+        if (isAtomic) {
+            auto* obj = reinterpret_cast<std::atomic<T>*>(objPtr);
+            value = obj->load(std::memory_order_acquire);
+        } else if (isAtomicRef) {
+            std::atomic_ref<T> ref(*reinterpret_cast<T*>(objPtr));
+            value = ref.load(std::memory_order_acquire);
+        } else {
+            heap_header* head = reinterpret_cast<heap_header*>(this->memory);
             pthread_mutex_lock(&head->heapMutex);
             if (errno == EOWNERDEAD) {
                 pthread_mutex_consistent(&head->heapMutex);
             }
             value = *reinterpret_cast<T*>(objPtr);
             pthread_mutex_unlock(&head->heapMutex);
-        } else {
-            auto* atomicPtr = reinterpret_cast<std::atomic<T>*>(objPtr);
-            value = atomicPtr->load(std::memory_order_acquire);
         }
 
         return value;
     }
 
-    void free(std::size_t offset) {
-        if (offset == 0) {
-            return;
-        }
-
-        if (verrifyMapping() < 0) {
-            return;
-        }
-
-        char* base = reinterpret_cast<char*>(this->memoryp);
-        char* objPtr = base + offset;
-
-        char* blockStart = align8_down(objPtr - sizeof(blockHeader));
-
-        if (align8_offset(blockStart) != 0) {
-            std::cerr << "free unaligned";
-            return;
-        }
-
-        auto* header = reinterpret_cast<blockHeader*>(blockStart);
-        std::size_t blockSize = unpack_size(header->sizeAndFlags.load(std::memory_order_acquire));
-
-        auto* block = reinterpret_cast<freeBlockHeader*>(blockStart);
-        heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
-        block->size.store(blockSize, std::memory_order_release);
-
-        auto unlink_block = [&](freeBlockHeader* target, char* targetStart) {
-            const std::int64_t prevOffset = target->prev.load(std::memory_order_acquire);
-            const std::int64_t nextOffset = target->next.load(std::memory_order_acquire);
-
-            if (prevOffset != -1) {
-                auto* prev = reinterpret_cast<freeBlockHeader*>(base + prevOffset);
-                prev->next.store(nextOffset, std::memory_order_release);
-            } else {
-                head->nextFree.store(nextOffset, std::memory_order_release);
-            }
-
-            if (nextOffset != -1) {
-                auto* next = reinterpret_cast<freeBlockHeader*>(base + nextOffset);
-                next->prev.store(prevOffset, std::memory_order_release);
-            }
-
-            target->prev.store(-1, std::memory_order_release);
-            target->next.store(-1, std::memory_order_release);
-        };
-
-        // Coalesce by scanning the free list for adjacent blocks.
-        std::int64_t curOffset = head->nextFree.load(std::memory_order_acquire);
-        freeBlockHeader* left = nullptr;
-        freeBlockHeader* right = nullptr;
-        char* leftStart = nullptr;
-        char* rightStart = nullptr;
-
-        while (curOffset != -1) {
-            char* curStart = base + curOffset;
-            auto* cur = reinterpret_cast<freeBlockHeader*>(curStart);
-            const std::size_t curSize = cur->size.load(std::memory_order_acquire);
-
-            if (curStart + curSize == blockStart) {
-                left = cur;
-                leftStart = curStart;
-            } else if (blockStart + blockSize == curStart) {
-                right = cur;
-                rightStart = curStart;
-            }
-
-            if (left && right) {
-                break;
-            }
-            curOffset = cur->next.load(std::memory_order_acquire);
-        }
-
-        if (left) {
-            unlink_block(left, leftStart);
-            blockStart = leftStart;
-            block = left;
-            blockSize += left->size.load(std::memory_order_acquire);
-        }
-
-        if (right) {
-            unlink_block(right, rightStart);
-            blockSize += right->size.load(std::memory_order_acquire);
-        }
-
-        block->size.store(blockSize, std::memory_order_release);
-
-        const std::int64_t blockOffset = static_cast<std::int64_t>(blockStart - base);
-        const std::int64_t oldHead = head->nextFree.load(std::memory_order_acquire);
-
-        block->prev.store(-1, std::memory_order_release);
-        block->next.store(oldHead, std::memory_order_release);
-
-        if (oldHead != -1) {
-            auto* oldHeadPtr = reinterpret_cast<freeBlockHeader*>(base + oldHead);
-            oldHeadPtr->prev.store(blockOffset, std::memory_order_release);
-        }
-
-        head->nextFree.store(blockOffset, std::memory_order_release);
-    }
-
-private:
-    int heapfd;
-    void* memoryp;
-
-    std::string name;
-    bool isOwner;
-    std::uint64_t localVersion;
-    std::uint64_t localBrk;
-
-    int verrifyMapping() {
-        std::uint64_t totalWait = 0;
-
-        std::uint64_t currentVersion = reinterpret_cast<heapHeader*>(this->memoryp)->version.load(std::memory_order_acquire);
-        while (currentVersion % 2 != 0) {
-            usleep(1000);
-            totalWait += 1000;
-
-            if (totalWait >= 50000) {
-                return -1;
-            }
-
-            currentVersion = reinterpret_cast<heapHeader*>(this->memoryp)->version.load(std::memory_order_acquire);
-        }
-
-        if (currentVersion != this->localVersion) {
-            std::size_t newBrk = reinterpret_cast<heapHeader*>(this->memoryp)->brk.load(std::memory_order_acquire);
-            if (munmap(this->memoryp, this->localBrk) < 0) {
-                std::cerr << "brk munmap";
-                return -1;
-            }
-
-            this->memoryp = mmap(NULL, newBrk, PROT_READ | PROT_WRITE, MAP_SHARED, this->heapfd, 0);
-            if (this->memoryp == MAP_FAILED) {
-                std::cerr <<"brk mmap";
-                return -1;
-            }
-
-            this->localVersion = currentVersion;
-            this->localBrk = newBrk;
-        }
-
-        return 0;
-    }
-
-    bool atomics_lock_free() const {
-        return std::atomic<std::uint8_t>().is_lock_free() &&
-            std::atomic<pid_t>().is_lock_free() &&
-            std::atomic<std::uint64_t>().is_lock_free() &&
-            std::atomic<std::int64_t>().is_lock_free() &&
-            std::atomic<std::size_t>().is_lock_free();
-    }
-
-    std::size_t brk(std::size_t bytes) {
-        if (verrifyMapping() < 0) {
-            return 0;
-        }
-
-        heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
-        if (head->noResize.load(std::memory_order_acquire) != 0) {
-            return 0;
-        }
-
-        std::size_t currentBrk = head->brk.load(std::memory_order_acquire);
-        if (bytes <= currentBrk) {
-            return currentBrk;
-        }
-
-        bytes = (bytes + 7u) & ~static_cast<std::size_t>(7u);
-        if (bytes <= currentBrk) {
-            return currentBrk;
-        }
-
-        std::uint64_t version = head->version.load(std::memory_order_acquire);
-        std::uint64_t totalWait = 0;
-        while (true) {
-            if ((version % 2) != 0) {
-                usleep(1000);
-                totalWait += 1000;
-                if (totalWait >= 50000) {
-                    return 0;
-                }
-                version = head->version.load(std::memory_order_acquire);
-                continue;
-            }
-
-            std::uint64_t desired = version + 1;
-            if (head->version.compare_exchange_weak(version, desired, std::memory_order_acq_rel)) {
-                version = desired;
-                break;
-            }
-        }
-
-        if (ftruncate(this->heapfd, bytes) < 0) {
-            head->version.store(version + 1, std::memory_order_release);
-            return 0;
-        }
-
-        if (munmap(this->memoryp, this->localBrk) < 0) {
-            head->version.store(version + 1, std::memory_order_release);
-            return 0;
-        }
-
-        this->memoryp = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, this->heapfd, 0);
-        if (this->memoryp == MAP_FAILED) {
-            head->version.store(version + 1, std::memory_order_release);
-            return 0;
-        }
-
-        head = reinterpret_cast<heapHeader*>(this->memoryp);
-        char* base = reinterpret_cast<char*>(this->memoryp);
-
-        std::size_t oldBrk = currentBrk;
-        std::size_t newBlockSize = bytes - oldBrk;
-
-        freeBlockHeader* block = reinterpret_cast<freeBlockHeader*>(base + oldBrk);
-        block->size.store(newBlockSize, std::memory_order_release);
-        block->prev.store(-1, std::memory_order_release);
-        block->next.store(-1, std::memory_order_release);
-
-        auto unlink_block = [&](freeBlockHeader* target) {
-            const std::int64_t prevOffset = target->prev.load(std::memory_order_acquire);
-            const std::int64_t nextOffset = target->next.load(std::memory_order_acquire);
-
-            if (prevOffset != -1) {
-                auto* prev = reinterpret_cast<freeBlockHeader*>(base + prevOffset);
-                prev->next.store(nextOffset, std::memory_order_release);
-            } else {
-                head->nextFree.store(nextOffset, std::memory_order_release);
-            }
-
-            if (nextOffset != -1) {
-                auto* next = reinterpret_cast<freeBlockHeader*>(base + nextOffset);
-                next->prev.store(prevOffset, std::memory_order_release);
-            }
-
-            target->prev.store(-1, std::memory_order_release);
-            target->next.store(-1, std::memory_order_release);
-        };
-
-        std::int64_t curOffset = head->nextFree.load(std::memory_order_acquire);
-        freeBlockHeader* left = nullptr;
-        freeBlockHeader* right = nullptr;
-        char* leftStart = nullptr;
-        char* rightStart = nullptr;
-        char* blockStart = base + oldBrk;
-        std::size_t blockSize = newBlockSize;
-
-        while (curOffset != -1) {
-            char* curStart = base + curOffset;
-            auto* cur = reinterpret_cast<freeBlockHeader*>(curStart);
-            const std::size_t curSize = cur->size.load(std::memory_order_acquire);
-
-            if (curStart + curSize == blockStart) {
-                left = cur;
-                leftStart = curStart;
-            } else if (blockStart + blockSize == curStart) {
-                right = cur;
-                rightStart = curStart;
-            }
-
-            if (left && right) {
-                break;
-            }
-            curOffset = cur->next.load(std::memory_order_acquire);
-        }
-
-        if (left) {
-            unlink_block(left);
-            blockStart = leftStart;
-            block = left;
-            blockSize += left->size.load(std::memory_order_acquire);
-        }
-
-        if (right) {
-            unlink_block(right);
-            blockSize += right->size.load(std::memory_order_acquire);
-        }
-
-        block->size.store(blockSize, std::memory_order_release);
-
-        const std::int64_t blockOffset = static_cast<std::int64_t>(blockStart - base);
-        const std::int64_t oldHead = head->nextFree.load(std::memory_order_acquire);
-
-        block->prev.store(-1, std::memory_order_release);
-        block->next.store(oldHead, std::memory_order_release);
-
-        if (oldHead != -1) {
-            auto* oldHeadPtr = reinterpret_cast<freeBlockHeader*>(base + oldHead);
-            oldHeadPtr->prev.store(blockOffset, std::memory_order_release);
-        }
-
-        head->nextFree.store(blockOffset, std::memory_order_release);
-        head->brk.store(bytes, std::memory_order_release);
-
-        std::uint64_t newVersion = version + 1;
-        head->version.store(newVersion, std::memory_order_release);
-
-        this->localBrk = bytes;
-        this->localVersion = newVersion;
-
-        return bytes;
-    }
-
     std::size_t allocation_size(char* blockStart, std::size_t objSize) const {
-        std::size_t offset = sizeof(blockHeader);
+        std::size_t offset = sizeof(block_header);
         // Keep payload 8-byte aligned for shared memory safety.
         offset += align8_offset(blockStart + offset);
         offset += objSize;
         offset += align8_offset(blockStart + offset);
-        if (offset < sizeof(freeBlockHeader)) {
-            offset = sizeof(freeBlockHeader);
+        if (offset < sizeof(block_header)) {
+            offset = sizeof(block_header);
         }
         return offset;
     }
 
-    static constexpr std::uint64_t kBlockFlagNeedLock = 0x1ULL;
-
-    static std::uint64_t pack_block_header(std::size_t size, bool needLock) {
-        std::uint64_t value = static_cast<std::uint64_t>(size);
-        if (needLock) {
-            value |= kBlockFlagNeedLock;
+    std::size_t get_block(block_header** blk, std::size_t size) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            *blk = nullptr;
+            return 0;
         }
-        return value;
-    }
 
-    static std::size_t unpack_size(std::uint64_t value) {
-        return static_cast<std::size_t>(value & ~kBlockFlagNeedLock);
-    }
+        heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        char* base = reinterpret_cast<char*>(this->memory);
 
-    static bool unpack_need_lock(std::uint64_t value) {
-        return (value & kBlockFlagNeedLock) != 0;
-    }
+        std::size_t blockAddress = head->block.load(std::memory_order_acquire);
+        block_header* block = reinterpret_cast<block_header*>(base + blockAddress);
 
-    void* fragment(void* ptr, std::size_t size) {
-        freeBlockHeader* block = reinterpret_cast<freeBlockHeader*>(ptr);
-        const std::size_t blockSize = block->size.load(std::memory_order_acquire);
-        char* blockStart = reinterpret_cast<char*>(block);
-        const std::size_t alignedSize = size + align8_offset(blockStart + size);
-        heapHeader* head = reinterpret_cast<heapHeader*>(this->memoryp);
+        std::size_t blockMeta = block->meta.load(std::memory_order_acquire);
+        std::size_t blockFlags = unpack_block_flags(blockMeta);
 
-        std::int64_t prevOffset = block->prev.load(std::memory_order_acquire);
-        std::int64_t nextOffset = block->next.load(std::memory_order_acquire);
+        std::size_t requiredSize = allocation_size(reinterpret_cast<char*>(block), size);
 
-        if (blockSize > alignedSize + sizeof(freeBlockHeader) + 8u) {
-            char* newFreeStart = blockStart + alignedSize;
-            freeBlockHeader* newFree = reinterpret_cast<freeBlockHeader*>(newFreeStart);
-            const std::size_t remainingSize = blockSize - alignedSize;
+        while (blockFlags & K_BLOCK_ALLOCATED || unpack_block_size(blockMeta) < requiredSize) {
+            std::size_t next = block->next.load(std::memory_order_acquire);
+            if (next == -1) {
+                std::size_t required = this->sstat.size + requiredSize;
+                std::size_t newSize = 2 * this->sstat.size > required ? 2* this->sstat.size : required;
+                if (resize_shm(&this->memory, &sstat, newSize) == 0) {
+                    *blk = nullptr;
+                    return 0;
+                }
 
-            newFree->size.store(remainingSize, std::memory_order_release);
-            newFree->prev.store(prevOffset, std::memory_order_release);
-            newFree->next.store(nextOffset, std::memory_order_release);
+                std::size_t nBlockAddress = blockAddress + unpack_block_size(blockMeta);
+                block_header* nBlock = reinterpret_cast<block_header*>(base + nBlockAddress);
+                std::size_t nBlockSize = round8_down(this->sstat.size - nBlockAddress);
 
-            if (prevOffset != -1) {
-                auto* prev = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + prevOffset);
-                prev->next.store(static_cast<std::int64_t>(newFreeStart - reinterpret_cast<char*>(this->memoryp)), std::memory_order_release);
-            } else {
-                head->nextFree.store(static_cast<std::int64_t>(newFreeStart - reinterpret_cast<char*>(this->memoryp)), std::memory_order_release);
+                nBlock->next.store(-1, std::memory_order_release);
+                nBlock->prev.store(blockAddress, std::memory_order_release);
+                nBlock->meta.store(pack_block_meta(nBlockSize, 0), std::memory_order_release);
+
+                block->next.store(nBlockAddress, std::memory_order_release);
+
+                next = nBlockAddress;
             }
 
-            if (nextOffset != -1) {
-                auto* next = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + nextOffset);
-                next->prev.store(static_cast<std::int64_t>(newFreeStart - reinterpret_cast<char*>(this->memoryp)), std::memory_order_release);
+            block = reinterpret_cast<block_header*>(base + next);
+            blockAddress = next;
+
+            blockMeta = block->meta.load(std::memory_order_acquire);
+            blockFlags = unpack_block_flags(blockMeta);
+
+            requiredSize = allocation_size(reinterpret_cast<char*>(block), size);
+        }
+
+        std::size_t blockSize = unpack_block_size(blockMeta);
+        std::size_t remaining = blockSize - requiredSize;
+        if (remaining >= requiredSize) {
+            std::size_t nBlockSize = round8_down(remaining);
+            std::size_t nBlockAddress = blockAddress + requiredSize;
+            std::size_t nBlockMeta = pack_block_meta(nBlockSize, 0);
+
+            block_header* nBlock = reinterpret_cast<block_header*>(base + nBlockAddress);
+
+            nBlock->prev.store(blockAddress, std::memory_order_release);
+            nBlock->next.store(block->next.load(std::memory_order_acquire), std::memory_order_release);
+            nBlock->meta.store(nBlockMeta, std::memory_order_release);
+
+            std::int64_t next = nBlock->next.load(std::memory_order_acquire);
+            if (next != -1) {
+                block_header* nextBlock = reinterpret_cast<block_header*>(base + next);
+                nextBlock->prev.store(nBlockAddress, std::memory_order_release);
             }
 
-            block->size.store(alignedSize, std::memory_order_release);
-            return block;
+            blockMeta = pack_block_meta(requiredSize, 0);
+            block->meta.store(blockMeta, std::memory_order_release);
+            block->next.store(nBlockAddress, std::memory_order_release);
         }
 
-        if (prevOffset != -1) {
-            auto* prev = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + prevOffset);
-            prev->next.store(nextOffset, std::memory_order_release);
-        } else {
-            head->nextFree.store(nextOffset, std::memory_order_release);
-        }
-
-        if (nextOffset != -1) {
-            auto* next = reinterpret_cast<freeBlockHeader*>(reinterpret_cast<char*>(this->memoryp) + nextOffset);
-            next->prev.store(prevOffset, std::memory_order_release);
-        }
-
-        block->size.store(blockSize, std::memory_order_release);
-        return block;
+        *blk = block;
+        return blockAddress;
     }
+
+    void* memory;
+    shm_stat sstat;
+    std::string name;
 };
+
+inline shared_heap* sheap(std::string name) {
+    static std::unordered_map<std::string, shared_heap> heaps;
+    auto [it, inserted] = heaps.try_emplace(name, name);
+    return &it->second;
+}
