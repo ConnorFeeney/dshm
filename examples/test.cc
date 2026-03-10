@@ -1,4 +1,4 @@
-#include "dshm/shared.h"
+#include "dshm/shared_heap.h"
 #include <iostream>
 
 int main() {
