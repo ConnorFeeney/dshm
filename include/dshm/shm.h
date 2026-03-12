@@ -21,7 +21,6 @@ static std::size_t round8_up(std::size_t n) {
     return (n + 7u) & ~static_cast<std::size_t>(7u);
 }
 
-
 typedef struct shm_stat {
     std::size_t size;
     std::uint64_t meta;
