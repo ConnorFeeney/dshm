@@ -297,6 +297,43 @@ public:
     }
 
     template<typename T>
+    requires std::is_integral_v<T>
+    bool fetch_add(std::size_t addr, T amount) {
+        if (!verify_shm(&this->memory, &sstat)) {
+            return false;
+        }
+
+        char* base = reinterpret_cast<char*>(this->memory);
+        char* objPtr = base + addr;
+        char* blockStart = reinterpret_cast<char*>(round8_down(reinterpret_cast<std::uintptr_t>(objPtr - sizeof(block_header))));
+
+        block_header* block = reinterpret_cast<block_header*>(blockStart);
+
+        static_assert(std::is_trivially_copyable<T>::value, "Type must be trivially copyable");
+        const std::uint64_t blockMeta = block->meta.load(std::memory_order_acquire);
+        const std::uint64_t blockFlags = unpack_block_flags(blockMeta);
+
+        const bool isAtomic = blockFlags & K_BLOCK_ATOMIC;
+        const bool isAtomicRef = blockFlags & K_BLOCK_ATOMIC_REF;
+
+        if (isAtomic) {
+            auto* obj = reinterpret_cast<std::atomic<T>*>(objPtr);
+            obj->fetch_add(amount, std::memory_order_release);
+        } else if (isAtomicRef) {
+            std::atomic_ref<T> ref(*reinterpret_cast<T*>(objPtr));
+            ref.fetch_add(amount, std::memory_order_release);
+        } else {
+            heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+            pthread_mutex_lock(&head->heapMutex);
+            if (errno == EOWNERDEAD) {
+                pthread_mutex_consistent(&head->heapMutex);
+            }
+            *reinterpret_cast<T*>(objPtr) += amount;
+            pthread_mutex_unlock(&head->heapMutex);
+        }
+    }
+
+    template<typename T>
     bool write_index(std::size_t addr, std::size_t index, const T& val) {
         if (!verify_shm(&this->memory, &sstat)) {
             return false;
