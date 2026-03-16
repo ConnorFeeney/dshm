@@ -6,6 +6,9 @@
 
 typedef struct heap_header {
     pthread_mutex_t heapMutex;
+    pthread_mutex_t blockMutex;
+    pthread_mutex_t tableMutex;
+
     std::atomic<std::size_t> table;
     std::atomic<std::int64_t> block;
 } heap_header;
@@ -73,7 +76,11 @@ public:
                 pthread_mutexattr_destroy(&attr);
                 return;
             }
-            if (pthread_mutex_init(&head->heapMutex, &attr) != 0) {
+            if (
+                pthread_mutex_init(&head->heapMutex, &attr) != 0 ||
+                pthread_mutex_init(&head->blockMutex, &attr) != 0 ||
+                pthread_mutex_init(&head->tableMutex, &attr) != 0
+            ) {
                 pthread_mutexattr_destroy(&attr);
                 return;
             }
@@ -122,6 +129,12 @@ public:
         const bool lockFree = std::atomic<T>::is_always_lock_free;
         const std::size_t objSize = lockFree ? sizeof(std::atomic<T>) : sizeof(T);
         block_header* block = nullptr;
+
+        heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        pthread_mutex_lock(&head->blockMutex);
+        if (errno == EOWNERDEAD) {
+            pthread_mutex_consistent(&head->blockMutex);
+        }
         std::size_t blockAddr = get_block(&block, objSize);
         if (block == nullptr) {
             return 0;
@@ -137,12 +150,12 @@ public:
 
         std::size_t blockSize = unpack_block_size(block->meta.load(std::memory_order_acquire));
         block->meta.store(pack_block_meta(blockSize, flags), std::memory_order_release);
+        pthread_mutex_unlock(&head->blockMutex);
 
         if (lockFree) {
             T initial(std::forward<Args>(args)...);
             ::new (objPtr) std::atomic<T>(initial);
         } else {
-            heap_header* head = reinterpret_cast<heap_header*>(this->memory);
             pthread_mutex_lock(&head->heapMutex);
             if (errno == EOWNERDEAD) {
                 pthread_mutex_consistent(&head->heapMutex);
@@ -163,6 +176,12 @@ public:
         const bool lockFree = std::atomic<T>::is_always_lock_free;
         const std::size_t arraySizeBytes = sizeof(T) * size;
         block_header* block = nullptr;
+
+        heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        pthread_mutex_lock(&head->blockMutex);
+        if (errno == EOWNERDEAD) {
+            pthread_mutex_consistent(&head->blockMutex);
+        }
         std::size_t blockAddr = get_block(&block, arraySizeBytes);
         if (block == nullptr) {
             return 0;
@@ -179,6 +198,7 @@ public:
 
         std::size_t blockSize = unpack_block_size(block->meta.load(std::memory_order_acquire));
         block->meta.store(pack_block_meta(blockSize, flags), std::memory_order_release);
+        pthread_mutex_unlock(&head->blockMutex);
 
         return static_cast<std::size_t>(objPtr - reinterpret_cast<char*>(this->memory));
     }
@@ -198,9 +218,16 @@ public:
 
         std::size_t blockAddr = static_cast<std::size_t>(blockStart - base);
         block_header* block = reinterpret_cast<block_header*>(blockStart);
+
+        heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        pthread_mutex_lock(&head->blockMutex);
+        if (errno == EOWNERDEAD) {
+            pthread_mutex_consistent(&head->blockMutex);
+        }
         std::size_t blockMeta = block->meta.load(std::memory_order_acquire);
         std::size_t blockFlags = unpack_block_flags(blockMeta);
         if ((blockFlags & K_BLOCK_ALLOCATED) == 0) {
+            pthread_mutex_unlock(&head->blockMutex);
             return false;
         }
 
@@ -243,6 +270,7 @@ public:
         }
 
         block->meta.store(pack_block_meta(blockSize, 0), std::memory_order_release);
+        pthread_mutex_unlock(&head->blockMutex);
         return true;
     }
 
@@ -331,6 +359,8 @@ public:
             *reinterpret_cast<T*>(objPtr) += amount;
             pthread_mutex_unlock(&head->heapMutex);
         }
+
+        return true;
     }
 
     template<typename T>
@@ -399,6 +429,10 @@ public:
         if (name.empty()) return false;
 
         heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        pthread_mutex_lock(&head->tableMutex);
+        if (errno == EOWNERDEAD) {
+            pthread_mutex_consistent(&head->tableMutex);
+        }
         std::size_t rootAddr = head->table.load(std::memory_order_acquire);
 
         rb_node root = this->read<rb_node>(rootAddr);
@@ -409,6 +443,7 @@ public:
             root.key_size  = name.size();
             root.data_addr = addr;
             this->write<rb_node>(rootAddr, root);
+            pthread_mutex_unlock(&head->tableMutex);
             return true;
         }
 
@@ -430,13 +465,17 @@ public:
             } else {
                 cur.data_addr = addr;
                 this->write<rb_node>(curAddr, cur);
+                pthread_mutex_unlock(&head->tableMutex);
                 return true;
             }
         }
 
         // Allocate key storage and new red node
         std::size_t keyAddr = this->allocate_array<char>(name.size());
-        if (keyAddr == 0) return false;
+        if (keyAddr == 0) {
+            pthread_mutex_unlock(&head->tableMutex);
+            return false;
+        }
         this->buffer_store<char>(keyAddr, name.c_str(), name.size());
 
         rb_node newNode{};
@@ -449,7 +488,10 @@ public:
         newNode.isRed     = true;
 
         std::size_t newAddr = this->allocate<rb_node>(newNode);
-        if (newAddr == 0) return false;
+        if (newAddr == 0) {
+            pthread_mutex_unlock(&head->tableMutex);
+            return false;
+        }
 
         rb_node par = this->read<rb_node>(parAddr);
         if (wentLeft) par.left  = newAddr;
@@ -526,6 +568,7 @@ public:
             break;
         }
 
+        pthread_mutex_unlock(&head->tableMutex);
         return true;
     }
 
@@ -534,13 +577,23 @@ public:
         if (name.empty()) return false;
 
         heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        pthread_mutex_lock(&head->tableMutex);
+        if (errno == EOWNERDEAD) {
+            pthread_mutex_consistent(&head->tableMutex);
+        }
         std::size_t rootAddr = head->table.load(std::memory_order_acquire);
 
-        if (this->read<rb_node>(rootAddr).key_addr == 0) return false;
+        if (this->read<rb_node>(rootAddr).key_addr == 0) {
+            pthread_mutex_unlock(&head->tableMutex);
+            return false;
+        }
 
         // Step 1: BST search for the key
         std::size_t curAddr = rb_find(name);
-        if (curAddr == 0) return false;
+        if (curAddr == 0) {
+            pthread_mutex_unlock(&head->tableMutex);
+            return false;
+        }
 
         // Step 2: Two-children → swap data with in-order successor, then delete successor
         // The successor node has at most a right child; its key is NOT freed here because
@@ -601,6 +654,7 @@ public:
                 this->write<rb_node>(curAddr, del);
                 if (oldKey != 0) this->free(oldKey);
             }
+            pthread_mutex_unlock(&head->tableMutex);
             return true;
         }
 
@@ -614,7 +668,10 @@ public:
         this->free(curAddr);
 
         // No fix-up needed if deleted node was red
-        if (delWasRed) return true;
+        if (delWasRed) {
+            pthread_mutex_unlock(&head->tableMutex);
+            return true;
+        }
 
         // Red child absorbs the double-black
         if (childAddr != 0) {
@@ -622,6 +679,7 @@ public:
             if (child.isRed) {
                 child.isRed = false;
                 this->write<rb_node>(childAddr, child);
+                pthread_mutex_unlock(&head->tableMutex);
                 return true;
             }
         }
@@ -729,6 +787,7 @@ public:
             break;
         }
 
+        pthread_mutex_unlock(&head->tableMutex);
         return true;
     }
 
