@@ -9,7 +9,7 @@ TEST_CASE("Test Shared Heap") {
         constexpr int writeVal = 200;
 
         std::size_t addr = sh.allocate<int>(initial);
-        CHECK(addr != 0);
+        REQUIRE(addr != 0);
 
         CHECK(sh.read<int>(addr) == initial);
 
@@ -17,14 +17,14 @@ TEST_CASE("Test Shared Heap") {
 
         CHECK(sh.read<int>(addr) == writeVal);
 
-        CHECK(sh.free(addr));
+        REQUIRE(sh.free(addr));
     }
 
     SUBCASE("Array Test") {
         constexpr std::size_t arraySize = 3;
 
         std::size_t addr = sh.allocate_array<int>(arraySize);
-        CHECK(addr != 0);
+        REQUIRE(addr != 0);
 
         CHECK(sh.write_index<int>(addr, 0, 5));
         CHECK(sh.write_index<int>(addr, 1, 10));
@@ -42,7 +42,7 @@ TEST_CASE("Test Shared Heap") {
         CHECK(sh.read_index<int>(addr, 1) == 15);
         CHECK(sh.read_index<int>(addr, 2) == 5);
 
-        CHECK(sh.free(addr));
+        REQUIRE(sh.free(addr));
     }
 
     SUBCASE("fetchAdd Test") {
@@ -50,27 +50,27 @@ TEST_CASE("Test Shared Heap") {
         constexpr int increment = 200;
 
         std::size_t addr = sh.allocate<int>(initial);
-        CHECK(addr != 0);
+        REQUIRE(addr != 0);
 
         CHECK(sh.fetch_add<int>(addr, increment));
 
         CHECK(sh.read<int>(addr) == initial + increment);
 
-        CHECK(sh.free(addr));
+        REQUIRE(sh.free(addr));
     }
 
     SUBCASE("Search Test") {
         constexpr int initial = 100;
 
         std::size_t addr1 = sh.allocate<int>(initial);
-        sh.name_addr(addr1, "valueABC");
-        CHECK(addr1 != 0);
+        REQUIRE(sh.name_addr(addr1, "valueABC"));
+        REQUIRE(addr1 != 0);
         std::size_t addr2 = sh.allocate<int>(initial);
-        sh.name_addr(addr2, "valueDEF");
-        CHECK(addr2 != 0);
+        REQUIRE(sh.name_addr(addr2, "valueDEF"));
+        REQUIRE(addr2 != 0);
         std::size_t addr3 = sh.allocate<int>(initial);
-        sh.name_addr(addr3, "valueGHI");
-        CHECK(addr3 != 0);
+        REQUIRE(sh.name_addr(addr3, "valueGHI"));
+        REQUIRE(addr3 != 0);
 
         std::size_t found1 = sh.find("valueABC");
         std::size_t found2 = sh.find("valueDEF");
