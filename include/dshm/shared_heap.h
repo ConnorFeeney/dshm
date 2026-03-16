@@ -795,9 +795,15 @@ public:
         if (!verify_shm(&this->memory, &this->sstat)) return 0;
         if (name.empty()) return 0;
 
+        heap_header* head = reinterpret_cast<heap_header*>(this->memory);
+        pthread_mutex_lock(&head->tableMutex);
+        if (errno == EOWNERDEAD) {
+            pthread_mutex_consistent(&head->tableMutex);
+        }
         std::size_t nodeAddr = rb_find(name);
         if (nodeAddr == 0) return 0;
 
+        pthread_mutex_unlock(&head->tableMutex);
         return this->read<rb_node>(nodeAddr).data_addr;
     }
 

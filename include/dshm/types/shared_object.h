@@ -38,6 +38,9 @@ public:
             heap->unname_addr(this->name);
         }
         heap->free(this->address);
+        
+        this->heap = nullptr;
+        this->address = 0;
     }
 
     std::size_t addr() const {
@@ -92,6 +95,13 @@ public:
         return *this;
     }
 
+    T operator++(int) requires std::is_integral_v<T> {
+        if (!heap || this->address == 0) return T{};
+        T old = heap->read<T>(this->address);
+        heap->fetch_add<T>(this->address, 1);
+        return old;
+    }
+
     T operator-(const T& value) requires std::is_integral_v<T> {
         if (!heap || this->address == 0) {
             return T{};
@@ -113,6 +123,13 @@ public:
         }
         heap->fetch_add<T>(this->address, -1);
         return *this;
+    }
+
+    T operator--(int) requires std::is_integral_v<T> {
+        if (!heap || this->address == 0) return T{};
+        T old = heap->read<T>(this->address);
+        heap->fetch_add<T>(this->address, -1);
+        return old;
     }
 
 private:
