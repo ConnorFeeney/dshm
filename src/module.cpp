@@ -85,7 +85,7 @@ void register_dtype(py::module_& m, const char* name) {
     py::object dtype = m.attr(name);
     factory_registry[dtype.ptr()] =
         [](std::string heap, std::string name) {
-            return py::cast(dshm_make_or_find<T>(heap, name), py::return_value_policy::move);
+            return py::cast(make_or_find<T>(heap, name), py::return_value_policy::move);
         };
 }
 

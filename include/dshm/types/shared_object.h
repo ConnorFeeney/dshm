@@ -74,13 +74,6 @@ public:
         return thisValue == otherValue;
     }
 
-    T operator+(const T& value) requires std::is_integral_v<T> {
-        if (!heap || this->address == 0) {
-            return T{};
-        }
-        return heap->read<T>(this->address) + value;
-    }
-
     shared_object& operator+=(const T& value) requires std::is_integral_v<T> {
         if (!heap || this->address == 0) {
             return *this;
@@ -102,13 +95,6 @@ public:
         T old = heap->read<T>(this->address);
         heap->fetch_add<T>(this->address, 1);
         return old;
-    }
-
-    T operator-(const T& value) requires std::is_integral_v<T> {
-        if (!heap || this->address == 0) {
-            return T{};
-        }
-        return heap->read<T>(this->address) - value;
     }
 
     shared_object& operator-=(const T& value) requires std::is_integral_v<T> {
@@ -141,7 +127,7 @@ private:
 };
 
 template<typename T>
-shared_object<T> dshm_make_or_find(std::string sharedHeap, std::string name) {
+shared_object<T> make_or_find(std::string sharedHeap, std::string name) {
     shared_heap* heap = sheap(sharedHeap);
     std::size_t searchAddr = heap->find(name);
     if (searchAddr == 0) {

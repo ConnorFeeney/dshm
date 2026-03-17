@@ -73,12 +73,12 @@ TEST_CASE("Test Shared Object") {
         REQUIRE(obj.addr() != 0);
 
         // dshm_make_or_find should find the existing object by name
-        shared_object<int> found = dshm_make_or_find<int>("testHeap", "searchObj");
+        shared_object<int> found = make_or_find<int>("testHeap", "searchObj");
         CHECK(found.addr() != 0);
         CHECK(found == 99);
 
         // dshm_make_or_find on a new name should allocate a new object
-        shared_object<int> created = dshm_make_or_find<int>("testHeap", "newSearchObj");
+        shared_object<int> created = make_or_find<int>("testHeap", "newSearchObj");
         CHECK(created.addr() != 0);
 
         // Addresses should differ since they are distinct objects
