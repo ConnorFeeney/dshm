@@ -33,15 +33,16 @@ if(NOT EXISTS ${VENV_PYTHON})
     )
 
     if(PIP_RESULT)
-        message(FATAL_ERROR "Failed to install pybind11-stubgen or pytest")
+        message(FATAL_ERROR "Failed to install pybind11-stubgen")
     endif()
 endif()
 
+# Avoid installing third-party headers/config into the wheel.
+set(PYBIND11_INSTALL OFF)
+set(PYBIND11_TEST OFF)
 add_subdirectory(extern/pybind11)
 pybind11_add_module(dshmpy src/module.cpp)
 target_link_libraries(dshmpy PRIVATE dshm)
-
-set_target_properties(dshmpy PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/dshm)
 
 add_custom_command(
     TARGET dshmpy
@@ -49,11 +50,12 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E env
         PYTHONPATH=$<TARGET_FILE_DIR:dshmpy>
         ${VENV_PYTHON} -m pybind11_stubgen dshmpy
-        --output-dir $<TARGET_FILE_DIR:dshmpy>
-    WORKING_DIRECTORY $<TARGET_FILE_DIR:dshmpy>
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/lib
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 # Tests
+set(DOCTEST_NO_INSTALL ON)
 add_subdirectory(extern/doctest)
 
 set(DSHM_CPP_TEST_SOURCE
@@ -64,3 +66,12 @@ set(DSHM_CPP_TEST_SOURCE
 
 add_executable(dshm_test ${DSHM_CPP_TEST_SOURCE})
 target_link_libraries(dshm_test PRIVATE dshm doctest::doctest)
+
+install(TARGETS dshmpy
+    LIBRARY DESTINATION .
+    RUNTIME DESTINATION .
+)
+
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/dshmpy.pyi
+    DESTINATION .
+)

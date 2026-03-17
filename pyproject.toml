@@ -1,0 +1,10 @@
+[build-system]
+requires = ["scikit-build-core"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "dshmpy"
+version = "1.0.0"
+
+[tool.scikit-build]
+cmake.args = ["--preset=release"]
