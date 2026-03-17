@@ -71,11 +71,11 @@ inline void* create_shm(std::string name, shm_stat* sstat) {
     bool newSHM = false;
     std::size_t bufferSize = 0;
 
-    int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRWXU | S_IRWXG | S_IRWXO);
+    int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
     if (fd != -1) {
         newSHM = true;
     } else if(fd == -1 && errno == EEXIST) {
-        fd = shm_open(name.c_str(), O_CREAT | O_RDWR, S_IRWXU | S_IRWXG | S_IRWXO);
+        fd = shm_open(name.c_str(), O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
         if (fd == -1) {
             return nullptr;
         }
@@ -114,6 +114,9 @@ inline void* create_shm(std::string name, shm_stat* sstat) {
         shm_meta |= K_SHM_LINK;
         head->meta.store(shm_meta, std::memory_order_release);
     } else {
+        if (fchmod(fd, S_IRUSR | S_IWUSR) == -1) {
+            perror("fchmod");
+        }
         shm_header* head = reinterpret_cast<shm_header*>(mmap(NULL, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
         if (head == MAP_FAILED) {
             return nullptr;
