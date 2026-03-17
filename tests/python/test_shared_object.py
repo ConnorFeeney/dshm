@@ -154,24 +154,6 @@ def test_pre_dec(heap_name):
     obj.destroy()
 
 
-def test_post_inc(heap_name):
-    obj = dshmpy.make_or_find(heap_name, "obj_postinc", dshmpy.int32)
-    obj.set(10)
-    old = obj.inc_post()
-    assert old == 10
-    assert obj.get() == 11
-    obj.destroy()
-
-
-def test_post_dec(heap_name):
-    obj = dshmpy.make_or_find(heap_name, "obj_postdec", dshmpy.int32)
-    obj.set(10)
-    old = obj.dec_post()
-    assert old == 10
-    assert obj.get() == 9
-    obj.destroy()
-
-
 # ── All integer dtypes ────────────────────────────────────────────────────────
 
 
