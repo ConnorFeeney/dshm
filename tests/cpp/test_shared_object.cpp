@@ -1,6 +1,8 @@
 #include "doctest/doctest.h"
 #include "dshm/types/shared_object.h"
 
+using namespace dshm;
+
 TEST_CASE("Test Shared Object") {
     SUBCASE("Allocation Test") {
         shared_heap* heap = sheap("testHeap");

@@ -3,6 +3,7 @@
 #include "dshm/shm.h"
 #include <unordered_map>
 
+namespace dshm {
 
 typedef struct heap_header {
     pthread_mutex_t heapMutex;
@@ -1038,4 +1039,6 @@ inline shared_heap* sheap(std::string name) {
     static std::unordered_map<std::string, shared_heap> heaps;
     auto [it, inserted] = heaps.try_emplace(name, name);
     return &it->second;
+}
+
 }

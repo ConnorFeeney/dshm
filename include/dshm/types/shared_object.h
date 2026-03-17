@@ -2,6 +2,8 @@
 
 #include "dshm/shared_heap.h"
 
+namespace dshm {
+
 template<typename T>
 class shared_object {
 public:
@@ -149,4 +151,6 @@ shared_object<T> dshm_make_or_find(std::string sharedHeap, std::string name) {
 
     shared_object<T> res(heap, searchAddr, name, shared_object<T>::from_address);
     return res;
+}
+
 }

@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include "dshm/types/shared_object.h"
 
+using namespace dshm;
 namespace py = pybind11;
 
 using factory_fn = std::function<py::object(std::string, std::string)>;

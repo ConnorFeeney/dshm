@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+namespace dshm {
+
 static constexpr std::uint8_t K_SHM_LINK = 1U << 0;
 
 static constexpr std::uint8_t K_STAT_OWNER = 1U << 0;
@@ -302,4 +304,6 @@ inline std::size_t resize_shm(void** ptr, shm_stat* sstat, std::size_t size) {
     *ptr = reinterpret_cast<void*>(reinterpret_cast<char*>(buffer) + sizeof(shm_header));
     sstat->size = size;
     return size;
+}
+
 }

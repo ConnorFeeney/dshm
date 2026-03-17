@@ -5,6 +5,8 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(BUILD_TESTS "Build C++ tests" ON)
+
 # DSHM
 add_library(dshm INTERFACE)
 target_include_directories(dshm INTERFACE ${CMAKE_SOURCE_DIR}/include)
@@ -60,17 +62,19 @@ add_custom_command(
 )
 
 # Tests
-set(DOCTEST_NO_INSTALL ON)
-add_subdirectory(extern/doctest)
+if(BUILD_TESTS)
+    set(DOCTEST_NO_INSTALL ON)
+    add_subdirectory(extern/doctest)
 
-set(DSHM_CPP_TEST_SOURCE
-    ${CMAKE_SOURCE_DIR}/tests/cpp/test_dshm_main.cpp
-    ${CMAKE_SOURCE_DIR}/tests/cpp/test_shared_heap.cpp
-    ${CMAKE_SOURCE_DIR}/tests/cpp/test_shared_object.cpp
-)
+    set(DSHM_CPP_TEST_SOURCE
+        ${CMAKE_SOURCE_DIR}/tests/cpp/test_dshm_main.cpp
+        ${CMAKE_SOURCE_DIR}/tests/cpp/test_shared_heap.cpp
+        ${CMAKE_SOURCE_DIR}/tests/cpp/test_shared_object.cpp
+    )
 
-add_executable(dshm_test ${DSHM_CPP_TEST_SOURCE})
-target_link_libraries(dshm_test PRIVATE dshm doctest::doctest)
+    add_executable(dshm_test ${DSHM_CPP_TEST_SOURCE})
+    target_link_libraries(dshm_test PRIVATE dshm doctest::doctest)
+endif()
 
 install(TARGETS dshmpy
     LIBRARY DESTINATION .

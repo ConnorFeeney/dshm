@@ -1,6 +1,8 @@
 #include "doctest/doctest.h"
 #include "dshm/shared_heap.h"
 
+using namespace dshm;
+
 TEST_CASE("Test Shared Heap") {
     shared_heap sh("testHeap");
 
