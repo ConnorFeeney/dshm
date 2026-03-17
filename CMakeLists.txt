@@ -44,13 +44,18 @@ add_subdirectory(extern/pybind11)
 pybind11_add_module(dshmpy src/module.cpp)
 target_link_libraries(dshmpy PRIVATE dshm)
 
+set(DSHMPY_STUB_DIR "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+if(NOT DSHMPY_STUB_DIR)
+    set(DSHMPY_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/lib")
+endif()
+
 add_custom_command(
     TARGET dshmpy
     POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E env
         PYTHONPATH=$<TARGET_FILE_DIR:dshmpy>
         ${VENV_PYTHON} -m pybind11_stubgen dshmpy
-        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/lib
+        --output-dir ${DSHMPY_STUB_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
@@ -72,6 +77,6 @@ install(TARGETS dshmpy
     RUNTIME DESTINATION .
 )
 
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/dshmpy.pyi
+install(FILES ${DSHMPY_STUB_DIR}/dshmpy.pyi
     DESTINATION .
 )
